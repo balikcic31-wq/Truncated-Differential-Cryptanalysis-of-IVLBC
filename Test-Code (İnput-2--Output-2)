@@ -1,0 +1,311 @@
+// ivlbc_test_perkey10fixed.c
+// Variant: 12 active nibble positions (1,2,3,4,5,6,8,9,11,12,14,15), remaining 4 nibble fixed per-key (random).
+// On-the-fly plaintext construction per i to avoid rebuilding huge plaintext array per key.
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define NUM_TEXTS (1 << 24)  
+#define NUM_KEYS  (1 << 8)   
+
+#define STATE_NIBBLES 16
+#define KEY_BYTES     16
+#define BLOCK_NIBBLES STATE_NIBBLES
+
+static const uint8_t IVLBC_SBOX[16] = {
+    0x0, 0xF, 0xE, 0x5, 0xD, 0x3, 0x6, 0xC,
+    0xB, 0x9, 0xA, 0x8, 0x7, 0x4, 0x2, 0x1
+};
+
+static const uint8_t IVLBC_PN[16] = {
+    0, 7, 10, 13, 4, 11, 14, 1, 8, 15, 2, 5, 12, 3, 6, 9
+};
+
+static const uint8_t Mmat[4][4] = {
+    {0,1,1,1},
+    {1,0,1,1},
+    {1,1,0,1},
+    {1,1,1,0}
+};
+
+static const uint8_t GF4_RED_POLY = 0x13; // x^4 + x + 1
+
+static uint8_t gf4_mul(uint8_t a, uint8_t b) {
+    uint8_t res = 0;
+    uint8_t tmp = a & 0xF;
+    for (int i = 0; i < 4; ++i) {
+        if ((b >> i) & 1) res ^= tmp;
+        uint8_t hi = (tmp & 0x8);
+        tmp = (tmp << 1) & 0xF;
+        if (hi) tmp ^= (GF4_RED_POLY & 0xF);
+    }
+    return res & 0xF;
+}
+static inline uint8_t gf4_add(uint8_t a, uint8_t b) { return (a ^ b) & 0xF; }
+
+void subcell(uint8_t state[STATE_NIBBLES]) {
+    for (int i = 0; i < STATE_NIBBLES; ++i) state[i] = IVLBC_SBOX[state[i] & 0xF];
+}
+
+void permute_nibble(uint8_t state[STATE_NIBBLES]) {
+    uint8_t tmp[STATE_NIBBLES];
+    for (int i = 0; i < STATE_NIBBLES; ++i) tmp[i] = state[i];
+    for (int i = 0; i < STATE_NIBBLES; ++i) {
+        uint8_t pos = IVLBC_PN[i] & 0xF;
+        tmp[pos] = state[i];
+    }
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+void mix_column(const uint8_t in[4], uint8_t out[4]) {
+    for (int r = 0; r < 4; ++r) {
+        uint8_t acc = 0;
+        for (int c = 0; c < 4; ++c) {
+            uint8_t a = Mmat[r][c];
+            if (a) {
+                uint8_t prod = gf4_mul(a, in[c]);
+                acc = gf4_add(acc, prod);
+            }
+        }
+        out[r] = acc & 0xF;
+    }
+}
+void mix_columns(uint8_t state[STATE_NIBBLES]) {
+    uint8_t tmp[STATE_NIBBLES];
+    for (int col = 0; col < 4; ++col) {
+        uint8_t in[4], out[4];
+        for (int r = 0; r < 4; ++r) in[r] = state[col*4 + r] & 0xF;
+        mix_column(in, out);
+        for (int r = 0; r < 4; ++r) tmp[col*4 + r] = out[r];
+    }
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+void add_round_key(uint8_t state[STATE_NIBBLES], const uint8_t round_key_nibbles[STATE_NIBBLES]) {
+    for (int i = 0; i < STATE_NIBBLES; ++i) state[i] ^= (round_key_nibbles[i] & 0xF);
+}
+
+void ivlbc_round(uint8_t state[STATE_NIBBLES], const uint8_t round_key_nibbles[STATE_NIBBLES]) {
+    add_round_key(state, round_key_nibbles);
+    subcell(state);
+    permute_nibble(state);
+    mix_columns(state);
+}
+
+static inline uint8_t get_bit_MSB(const uint8_t K[KEY_BYTES], int bit_index) {
+    int byte = bit_index / 8;
+    int pos = 7 - (bit_index % 8);
+    return (K[byte] >> pos) & 1;
+}
+static inline void set_bit_MSB(uint8_t K[KEY_BYTES], int bit_index, uint8_t v) {
+    int byte = bit_index / 8;
+    int pos = 7 - (bit_index % 8);
+    if (v & 1) K[byte] |= (1u << pos);
+    else K[byte] &= ~(1u << pos);
+}
+static uint32_t get_bits_as_uint_MSB(const uint8_t K[KEY_BYTES], int start, int len) {
+    uint32_t v = 0;
+    for (int i = 0; i < len; ++i) v = (v << 1) | get_bit_MSB(K, start + i);
+    return v;
+}
+static void set_bits_from_uint_MSB(uint8_t K[KEY_BYTES], int start, int len, uint32_t value) {
+    for (int i = 0; i < len; ++i) {
+        int shift = len - 1 - i;
+        uint8_t bit = (value >> shift) & 1;
+        set_bit_MSB(K, start + i, bit);
+    }
+}
+static void rotate_left_bits_64_region(uint8_t K[KEY_BYTES], int offset, int rot) {
+    rot %= 64;
+    if (rot == 0) return;
+    uint8_t tmp[8] = {0};
+    for (int i = 0; i < 64; ++i) {
+        int src = (i + rot) % 64;
+        int src_byte = src / 8;
+        int src_pos = 7 - (src % 8);
+        uint8_t bit = (K[offset + src_byte] >> src_pos) & 1;
+        int dst_byte = i / 8;
+        int dst_pos = 7 - (i % 8);
+        if (bit) tmp[dst_byte] |= (1u << dst_pos);
+    }
+    memcpy(K + offset, tmp, 8);
+}
+static inline uint8_t hi_nib(uint8_t b){ return (b >> 4) & 0xF; }
+static inline uint8_t lo_nib(uint8_t b){ return b & 0xF; }
+
+void ivlbc_key_schedule_alg3(const uint8_t key_in[KEY_BYTES],
+                             uint8_t *round_keys_out_nibbles,
+                             int Nr,
+                             const uint8_t sbox[16]) {
+    uint8_t K[KEY_BYTES];
+    memcpy(K, key_in, KEY_BYTES);
+
+    for (int i = 1; i <= Nr; ++i) {
+        rotate_left_bits_64_region(K, 0, 7);
+
+        {
+            uint32_t nib = get_bits_as_uint_MSB(K, 120, 4);
+            uint32_t sb = sbox[nib & 0xF] & 0xF;
+            set_bits_from_uint_MSB(K, 120, 4, sb);
+        }
+        {
+            uint32_t nib = get_bits_as_uint_MSB(K, 124, 4);
+            uint32_t sb = sbox[nib & 0xF] & 0xF;
+            set_bits_from_uint_MSB(K, 124, 4, sb);
+        }
+
+        {
+            uint32_t old5 = get_bits_as_uint_MSB(K, 64, 5);
+            uint32_t rc = (uint32_t)(i & 0x1F);
+            uint32_t nw = (old5 ^ rc) & 0x1F;
+            set_bits_from_uint_MSB(K, 64, 5, nw);
+        }
+
+        uint8_t *out = round_keys_out_nibbles + (size_t)(i-1) * 16;
+        for (int b = 0; b < 8; ++b) {
+            uint8_t by = K[8 + b];
+            out[2*b + 0] = hi_nib(by);
+            out[2*b + 1] = lo_nib(by);
+        }
+
+        uint8_t Knew[KEY_BYTES];
+        memcpy(Knew + 0,  K + 8, 4);
+        memcpy(Knew + 4,  K + 12,4);
+        memcpy(Knew + 8,  K + 0, 4);
+        memcpy(Knew + 12, K + 4, 4);
+        memcpy(K, Knew, KEY_BYTES);
+    }
+}
+
+static inline int is_desired_pair(const uint8_t a[BLOCK_NIBBLES], const uint8_t b[BLOCK_NIBBLES]) {
+    for (int i = 0; i < BLOCK_NIBBLES; ++i) {
+        uint8_t d = (a[i] ^ b[i]) & 0xF;
+        if (i >= 0 && i <= 3) {
+            if (d != 0) return 0;
+        } else {
+            if (d == 0) return 0;
+        }
+    }
+    return 1;
+}
+
+void ivlbc_encrypt_n_rounds(uint8_t state[BLOCK_NIBBLES],
+                            const uint8_t *round_keys_out_nibbles,
+                            int rounds) {
+    for (int r = 0; r < rounds; ++r) {
+        const uint8_t *rk = round_keys_out_nibbles + (size_t)r * BLOCK_NIBBLES;
+        ivlbc_round(state, rk);
+    }
+}
+
+static inline uint16_t pack_key4(const uint8_t s[BLOCK_NIBBLES]) {
+    return (uint16_t)((s[0] << 12) | (s[1] << 8) | (s[2] << 4) | (s[3]));
+}
+
+typedef struct { uint16_t key4; int idx; } keyidx_t;
+int cmp_keyidx(const void *A, const void *B) {
+    const keyidx_t *a = A; const keyidx_t *b = B;
+    if (a->key4 < b->key4) return -1;
+    if (a->key4 > b->key4) return 1;
+    return 0;
+}
+
+int main(void) {
+    srand((unsigned)time(NULL));
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    const int Nr_schedule = 29;
+    const int rounds_to_apply = 3;
+
+    uint8_t (*ciphertexts)[BLOCK_NIBBLES] = malloc((size_t)NUM_TEXTS * BLOCK_NIBBLES);
+    if (!ciphertexts) { perror("malloc ciphertexts"); return 1; }
+
+    int var_positions[12] = {1,2,3,4,5,6,8,9,11,12,14,15};
+    int widths[12] = {2,2,2,2,2,2,2,2,2,2,2,2};
+
+    int fixed_positions[4] = {0,7,10,13};
+    uint8_t fixed_values[4];
+
+    unsigned long long total_valid_pairs = 0;
+
+    uint8_t *round_keys_buf = malloc((size_t)Nr_schedule * BLOCK_NIBBLES);
+    if (!round_keys_buf) { perror("rk malloc"); return 1; }
+
+    for (int key_index = 0; key_index < NUM_KEYS; ++key_index) {
+        FILE *ur = fopen("/dev/urandom","rb");
+        if (ur) {
+            uint8_t buf[4];
+            if (fread(buf,1,4,ur) == 4) {
+                for (int t=0;t<4;++t) fixed_values[t] = buf[t] & 0xF;
+            } else {
+                for (int t=0;t<4;++t) fixed_values[t] = (uint8_t)(rand() & 0xF);
+            }
+            fclose(ur);
+        } else {
+            for (int t=0;t<4;++t) fixed_values[t] = (uint8_t)(rand() & 0xF);
+        }
+
+        printf("Key %3d: fixed nibbles =", key_index);
+        for (int t=0;t<4;++t) printf(" %x", fixed_values[t]);
+        printf("\n");
+
+        uint8_t key[KEY_BYTES];
+        for (int k = 0; k < KEY_BYTES; ++k) key[k] = (uint8_t)(rand() & 0xFF);
+        ivlbc_key_schedule_alg3(key, round_keys_buf, Nr_schedule, IVLBC_SBOX);
+
+        uint8_t state[BLOCK_NIBBLES];
+        for (uint32_t i = 0; i < (uint32_t)NUM_TEXTS; ++i) {
+            for (int t=0; t<4; ++t) state[ fixed_positions[t] ] = fixed_values[t] & 0xF;
+            int bitoff = 0;
+            for (int k = 0; k < 12; ++k) {
+                int w = widths[k];
+                uint8_t val = (uint8_t)((i >> bitoff) & ((1u << w) - 1));
+                state[ var_positions[k] ] = val & 0xF;
+                bitoff += w;
+            }
+            ivlbc_encrypt_n_rounds(state, round_keys_buf, rounds_to_apply);
+            memcpy(ciphertexts[i], state, BLOCK_NIBBLES);
+        }
+
+        keyidx_t *arr = malloc(sizeof(keyidx_t) * (size_t)NUM_TEXTS);
+        if (!arr) { perror("arr malloc"); return 1; }
+        for (uint32_t i = 0; i < (uint32_t)NUM_TEXTS; ++i) {
+            arr[i].key4 = pack_key4(ciphertexts[i]);
+            arr[i].idx  = (int)i;
+        }
+        qsort(arr, NUM_TEXTS, sizeof(keyidx_t), cmp_keyidx);
+
+        unsigned long long valid_pairs = 0;
+        int s = 0;
+        while (s < NUM_TEXTS) {
+            int e = s+1;
+            while (e < NUM_TEXTS && arr[e].key4 == arr[s].key4) ++e;
+            for (int p = s; p < e; ++p) {
+                for (int q = p+1; q < e; ++q) {
+                    if (is_desired_pair(ciphertexts[arr[p].idx], ciphertexts[arr[q].idx])) valid_pairs++;
+                }
+            }
+            s = e;
+        }
+        free(arr);
+
+        total_valid_pairs += valid_pairs;
+        printf("Key %3d: valid pairs = %llu, cumulative = %llu, avg so far = %.2f\n",
+               key_index,
+               valid_pairs,
+               total_valid_pairs,
+               (double)total_valid_pairs / (key_index + 1));
+        fflush(stdout);
+    }
+
+    double avg_valid_pairs = (double)total_valid_pairs / NUM_KEYS;
+    printf("Average valid pairs over %d keys: %f\n", NUM_KEYS, avg_valid_pairs);
+
+    free(ciphertexts);
+    free(round_keys_buf);
+    return 0;
+}
